@@ -101,6 +101,32 @@ end
 
 
 
+"""
+Forget everything that we remember about these cells: their result, runtime, published objects, logger, macro expansion, etc.
+
+This is not needed for normal notebook processes: when a cell is deleted, then it runs once more with empty code, which overwrites most of this. It is meant for a process where cells are evaluated once, and never looked at again: the main Pluto process, which uses a `PlutoRunner` to prerender text cells (an "offline renderer"). There, the entries of every notebook that was ever opened would stay in memory forever.
+"""
+function forget_cells!(cell_ids)
+    for cell_id in cell_ids
+        delete!(cell_results, cell_id)
+        delete!(cell_runtimes, cell_id)
+        delete!(cell_published_objects, cell_id)
+        delete!(cell_registered_bond_names, cell_id)
+        delete!(cell_expanded_exprs, cell_id)
+        delete!(pluto_cell_loggers, cell_id)
+        delete!(tree_display_extra_items, cell_id)
+        if haskey(computers, cell_id)
+            delete_computer!(computers, cell_id)
+        end
+        if haskey(cell_js_links, cell_id)
+            unregister_js_link(cell_id) # cancels the links
+            delete!(cell_js_links, cell_id)
+        end
+    end
+    nothing
+end
+
+
 "Return whether the `method` was defined inside this notebook, and not in external code."
 isfromcell(method::Method, cell_id::UUID) = endswith(String(method.file), string(cell_id))
 

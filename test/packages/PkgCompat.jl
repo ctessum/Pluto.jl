@@ -9,6 +9,67 @@ import TOML
 @testset "PkgCompat" begin
     PkgCompat.refresh_registry_cache()
 
+    @testset "Registries are only parsed when needed" begin
+        PkgCompat.invalidate_registry_cache()
+        @test PkgCompat._parsed_registries[] === nothing # (nothing is parsed or held in memory until it is needed)
+
+        @test PkgCompat.parsed_registries() isa Vector
+        @test !isempty(PkgCompat.parsed_registries())
+        @test PkgCompat._parsed_registries[] !== nothing
+
+        @test PkgCompat.package_exists("HTTP")
+
+        # the registries can be found without parsing them
+        paths = PkgCompat._registry_paths()
+        @test !isempty(paths)
+        @test Set(paths) == Set(r.path for r in PkgCompat.parsed_registries())
+    end
+
+    @testset "Unused registry data is freed" begin
+        # We only look at the names, versions and URLs of packages, so the files with dependencies and compat bounds (half of the registry) are not kept in memory.
+        for reg in PkgCompat.parsed_registries()
+            files = reg.in_memory_registry
+            files === nothing && continue # (registries that are not compressed are not kept in memory)
+            @test !any(path -> basename(path) in ("Deps.toml", "Compat.toml", "WeakDeps.toml", "WeakCompat.toml"), keys(files))
+            @test any(path -> basename(path) == "Versions.toml", keys(files))
+            @test any(path -> basename(path) == "Package.toml", keys(files))
+        end
+    end
+
+    @testset "Resolved environment detection" begin
+        # Resolving an environment is expensive in memory, so we skip it when it is not needed. This should only happen when we are sure.
+        project_toml(deps...) = "[deps]\n" * join(("$name = \"$uuid\"\n" for (name, uuid) in deps), "")
+        dates = "Dates" => "ade2ca70-3891-5945-98fb-dc099432e06a"
+        random = "Random" => "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+
+        mktempdir() do dir
+            write(joinpath(dir, "Project.toml"), project_toml(dates))
+
+            # no manifest yet
+            @test !PkgCompat.is_resolved_for_this_julia(PkgCompat.load_ctx(dir))
+
+            Pkg.resolve(PkgCompat.load_ctx(dir); io=devnull) # (only standard libraries, so this works offline)
+            @test isfile(joinpath(dir, "Manifest.toml"))
+            @test PkgCompat.is_resolved_for_this_julia(PkgCompat.load_ctx(dir))
+
+            # the dependencies changed since the manifest was made
+            write(joinpath(dir, "Project.toml"), project_toml(dates, random))
+            @test !PkgCompat.is_resolved_for_this_julia(PkgCompat.load_ctx(dir))
+            write(joinpath(dir, "Project.toml"), project_toml(dates))
+            @test PkgCompat.is_resolved_for_this_julia(PkgCompat.load_ctx(dir))
+
+            # the manifest was made by a different version of Julia
+            manifest = read(joinpath(dir, "Manifest.toml"), String)
+            @test occursin("julia_version = \"$(VERSION)\"", manifest)
+            write(joinpath(dir, "Manifest.toml"), replace(manifest, "julia_version = \"$(VERSION)\"" => "julia_version = \"1.2.3\""))
+            @test !PkgCompat.is_resolved_for_this_julia(PkgCompat.load_ctx(dir))
+
+            # an old manifest, without a hash of the project
+            write(joinpath(dir, "Manifest.toml"), replace(manifest, r"project_hash = \"[0-9a-f]+\"\n" => ""))
+            @test !PkgCompat.is_resolved_for_this_julia(PkgCompat.load_ctx(dir))
+        end
+    end
+
     @testset "Available versions" begin
         vs = PkgCompat.package_versions("HTTP")
 

@@ -166,6 +166,26 @@ const current_state_for_clients = WeakKeyDict{ClientSession,Any}()
 const current_state_for_clients_lock = ReentrantLock()
 const update_counter_for_debugging = Ref(0)
 
+"""
+Forget the last known state of a client, to be called when the client disconnects.
+
+A `WeakKeyDict` only removes the entry of a garbage collected key the next time that it is accessed, which does not happen after the last client of a notebook has disconnected. Until then, the entry keeps the outputs of all cells of that notebook in memory.
+"""
+function forget_client_state!(client::ClientSession)
+    delete!(current_state_for_clients, client)
+    nothing
+end
+
+"""
+Remove the client from `session.connected_clients`, and forget its state. Returns whether the client was connected.
+"""
+function disconnect_client!(session::ServerSession, client_id::Symbol)::Bool
+    client = pop!(session.connected_clients, client_id, nothing)
+    client === nothing && return false
+    forget_client_state!(client)
+    true
+end
+
 const update_counter_for_clients_1 = WeakKeyDict{ClientSession,Any}()
 const update_counter_for_clients_2 = WeakKeyDict{ClientSession,Any}()
 const update_counter_for_clients_3 = WeakKeyDict{ClientSession,Any}()

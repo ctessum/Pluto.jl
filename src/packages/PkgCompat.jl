@@ -172,6 +172,23 @@ end
 
 
 # ⚠️ Internal API with fallback
+"""
+Can the environment of `ctx` be used as it is, without resolving it first? This is the case if its Manifest was made by this version of Julia, and the dependencies and compat bounds in its Project did not change since then (the Manifest records a hash of the Project). Resolving such an environment does not change anything, but it is expensive: Pkg's resolver allocates a lot of memory, and a long-running process (like the Pluto server) does not give it back to the system.
+
+Returns `false` when in doubt.
+"""
+function is_resolved_for_this_julia(ctx::PkgContext)::Bool
+	try
+		v = manifest_julia_version(ctx)
+		v isa VersionNumber && (v.major, v.minor) == (VERSION.major, VERSION.minor) &&
+			Pkg.Operations.is_manifest_current(ctx.env) === true
+	catch
+		false
+	end
+end
+
+
+# ⚠️ Internal API with fallback
 function withio(f::Function, ctx::PkgContext, io::IO)
     @static if :io ∈ fieldnames(PkgContext)
         old_io = ctx.io
@@ -210,13 +227,66 @@ end
 _get_registries() = RegistryInstances.reachable_registries()
 
 # (✅ "Public" API using RegistryInstances)
-"The cached output value of `_get_registries`."
-const _parsed_registries = Ref(RegistryInstances.RegistryInstance[])
+"The cached output value of `_get_registries`, or `nothing` if the registries are not parsed (yet). Use [`parsed_registries`](@ref) to access it."
+const _parsed_registries = Ref{Union{Nothing,Vector{RegistryInstances.RegistryInstance}}}(nothing)
+
+# (⚠️ Internal API with fallback)
+"""
+Free the memory of the registry files that we never read.
+
+The General registry is kept in memory completely (all `.toml` files of all packages, 60000 files). We only look at the names, versions and URLs of packages, never at the dependencies and compat bounds. Those files are about half of the registry, so by removing them, we save ~15 MB of memory. (`RegistryInstances.registry_info` handles missing files, because not all packages have all of them.)
+
+This is best-effort: it uses an internal field of `RegistryInstances.RegistryInstance`, so any failure is ignored.
+"""
+function _free_unused_registry_data!(registries)
+	for reg in registries
+		try
+			files = reg.in_memory_registry
+			files === nothing && continue
+			for path in collect(keys(files))
+				if basename(path) in ("Deps.toml", "Compat.toml", "WeakDeps.toml", "WeakCompat.toml")
+					delete!(files, path)
+				end
+			end
+		catch
+		end
+	end
+	registries
+end
 
 # (✅ "Public" API using RegistryInstances)
-"Re-parse the installed registries from disk."
+"Re-parse the installed registries from disk, now."
 function refresh_registry_cache()
-	_parsed_registries[] = _get_registries()
+	_parsed_registries[] = _free_unused_registry_data!(_get_registries())
+end
+
+"""
+Parse the registries again the next time that they are needed.
+
+Parsing the registries takes a while, and then the General registry stays in memory (tens of MB). Pluto only needs them to show package names and versions, and to find out which imported packages are registered. So most of the time, they are not needed at all, for example when you open a notebook that already has its packages, and we don't parse them until they are used.
+"""
+invalidate_registry_cache() = (_parsed_registries[] = nothing; nothing)
+
+"The installed registries. They are parsed when they are first used, see [`invalidate_registry_cache`](@ref)."
+function parsed_registries()::Vector{RegistryInstances.RegistryInstance}
+	registries = _parsed_registries[]
+	registries === nothing ? refresh_registry_cache() : registries
+end
+
+"The paths of all installed registries (without parsing them, which `_get_registries` does)."
+function _registry_paths()::Vector{String}
+	paths = String[]
+	for depot in DEPOT_PATH
+		reg_dir = joinpath(depot, "registries")
+		isdir(reg_dir) || continue
+		candidates = readdir(reg_dir; join=true)
+		# a registry is either the toml file of a compressed registry, or a folder (unless there is a compressed registry with the same name)
+		compressed = filter(p -> isfile(p) && endswith(p, ".toml"), candidates)
+		compressed_names = Set(splitext(basename(p))[1] for p in compressed)
+		folders = filter(p -> isdir(p) && isfile(joinpath(p, "Registry.toml")) && basename(p) ∉ compressed_names, candidates)
+		append!(paths, compressed, folders)
+	end
+	paths
 end
 
 
@@ -236,10 +306,7 @@ function update_registries(; force::Bool=false)
 			# sometimes it just fails but we dont want Pluto to be too sensitive to that
 			Pkg.Registry.update()
 		end
-		try
-			refresh_registry_cache()
-		catch
-		end
+		invalidate_registry_cache()
 		_updated_registries_compat[] = true		
 	end
 end
@@ -255,7 +322,7 @@ function check_registry_age(max_age_ms = 1000.0 * 60 * 60 * 24 * 7)::Bool
 		# don't do this optimization in CI
 		return false
 	end
-	paths = [s.path for s in _get_registries()]
+	paths = _registry_paths()
 	isempty(paths) && return _updated_registries_compat[]
 	
 	mtimes = map(paths) do p
@@ -295,12 +362,6 @@ is_stdlib(package_name::String) = package_name ∈ GracefulPkg.stdlibs_past_pres
 
 
 
-# Initial fill of registry cache
-function __init__()
-    refresh_registry_cache()
-    global global_ctx=PkgContext()
-end
-
 ###
 # Package names
 ###
@@ -310,7 +371,7 @@ end
 """
 Return names of all registered packages.
 """
-function registered_package_names(;registries::Vector=_parsed_registries[])::Vector{String}
+function registered_package_names(;registries::Vector=parsed_registries())::Vector{String}
 	flatmap(registries) do reg
 		packages = values(reg.pkgs)
 		union!(String[
@@ -336,7 +397,7 @@ julia> Pluto.PkgCompat._registry_entries("Pluto")
  "/Users/fons/.julia/registries/General/P/Pluto"
 ```
 """
-function _registry_entries(package_name::AbstractString, registries::Vector=_parsed_registries[])::Vector{String}
+function _registry_entries(package_name::AbstractString, registries::Vector=parsed_registries())::Vector{String}
 	flatmap(registries) do reg
 		packages = values(reg.pkgs)
 		String[
@@ -357,7 +418,7 @@ function package_versions(package_name::AbstractString)::Vector
         ["stdlib"]
     else
 		try
-			flatmap(_parsed_registries[]) do reg
+			flatmap(parsed_registries()) do reg
 				uuids_with_name = RegistryInstances.uuids_from_name(reg, package_name)
 				flatmap(uuids_with_name) do u
 					pkg = get(reg, u, nothing)
@@ -381,7 +442,7 @@ Return a Vector of UUIDs for the given package name. Returns an empty Vector if 
 """
 function package_uuids(package_name::AbstractString)::Vector{Base.UUID}
 	try
-		flatmap(_parsed_registries[]) do reg
+		flatmap(parsed_registries()) do reg
 			RegistryInstances.uuids_from_name(reg, package_name)
 		end
 	catch e
@@ -399,7 +460,7 @@ function package_url(package_name::AbstractString)::Union{String,Nothing}
 		"https://docs.julialang.org/en/v1/stdlib/$(package_name)/"
     else
 		try
-			for reg in _parsed_registries[]
+			for reg in parsed_registries()
 				for u in RegistryInstances.uuids_from_name(reg, package_name)
 					pkg = get(reg, u, nothing)
 					if pkg !== nothing

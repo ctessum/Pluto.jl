@@ -124,7 +124,7 @@ function flushallclients(session::ServerSession, subset::Union{Set{ClientSession
         end
     end
     for to_delete_id in disconnected
-        delete!(session.connected_clients, to_delete_id)
+        disconnect_client!(session, to_delete_id)
     end
 end
 

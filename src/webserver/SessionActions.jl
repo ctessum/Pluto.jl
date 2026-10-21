@@ -257,6 +257,7 @@ function shutdown(session::ServerSession, notebook::Notebook; keep_in_session::B
         for client in listeners
             @async close(client.stream)
         end
+        Pluto.clear_topological_order_cache!()
     end
     WorkspaceManager.unmake_workspace((session, notebook); async, verbose, allow_restart=keep_in_session)
     try_event_call(session, ShutdownNotebookEvent(notebook))

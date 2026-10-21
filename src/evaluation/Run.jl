@@ -415,24 +415,33 @@ function update_save_run!(
 		# this makes the notebook load a lot faster - the front-end does not have to wait for each output, and perform costly reflows whenever one updates
 		# "A Workspace on the main process, used to prerender markdown before starting a notebook process for speedy UI."
 		offline_session = ServerSession()
-		offline_workspace = WorkspaceManager.make_workspace(
-			(
-				offline_session,
-				notebook,
-			),
-			is_offline_renderer=true,
-		)
+		to_run_offline = Cell[]
+		# We always clean up, also when something fails: an offline workspace that was not discarded would keep this notebook in memory forever.
+		try
+			offline_workspace = WorkspaceManager.make_workspace(
+				(
+					offline_session,
+					notebook,
+				),
+				is_offline_renderer=true,
+			)
 
-		to_run_offline = filter(c -> !c.running && is_just_text(new, c), cells)
-		for cell in to_run_offline
-			run_single!(offline_workspace, cell, new.nodes[cell], new.codes[cell])
+			try
+				to_run_offline = filter(c -> !c.running && is_just_text(new, c), cells)
+				for cell in to_run_offline
+					run_single!(offline_workspace, cell, new.nodes[cell], new.codes[cell])
+				end
+			finally
+				WorkspaceManager.discard_offline_workspace(offline_workspace, cell_id.(to_run_offline))
+			end
+		finally
+			finalize(offline_session)
 		end
 
 		to_run_online = setdiff(cells, to_run_offline)
 		
 		clear_not_prerenderable_cells && foreach(clear_output!, to_run_online)
 		
-		finalize(offline_session)
 		send_notebook_changes!(ClientRequest(; session, notebook))
 	end
 
@@ -670,6 +679,11 @@ end
 import LRUCache
 
 const _cache_for_topological_order = LRUCache.LRU{UInt, TopologicalOrder{Cell}}(; maxsize = 10)
+
+"""
+Empty the cache of `topological_order_cached`. A cached `TopologicalOrder` refers to the topology that it was computed from, which refers to all cells (and their outputs). So without this, a notebook that was shut down stays in memory until enough other topological orders were computed to push it out of the cache.
+"""
+clear_topological_order_cache!() = (empty!(_cache_for_topological_order); nothing)
 
 function topological_order_cached(topology::NotebookTopology, roots::AbstractVector{Cell}; kwargs...)
 	h = hash((

@@ -215,6 +215,7 @@ function run!(session::ServerSession)
         @async swallow_exception(() -> close(serversocket), Exception)
         for client in values(session.connected_clients)
             @async swallow_exception(() -> close(client.stream), Exception)
+            forget_client_state!(client)
         end
         empty!(session.connected_clients)
         for nb in values(session.notebooks)
@@ -291,9 +292,8 @@ function run!(session::ServerSession)
                                 @warn "Reading WebSocket client stream failed for unknown reason:" exception = (ex, bt)
                             end
                         finally
-                            if haskey(session.connected_clients, found_client_id_ref[])
-                                @debug "Removing client $(found_client_id_ref[]) from connected_clients"
-                                delete!(session.connected_clients, found_client_id_ref[])
+                            if disconnect_client!(session, found_client_id_ref[])
+                                @debug "Removed client $(found_client_id_ref[]) from connected_clients"
                             end
                         end
                     end

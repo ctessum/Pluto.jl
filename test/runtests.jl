@@ -59,6 +59,8 @@ verify_no_running_processes()
 verify_no_running_processes()
 @timeit_include("WorkspaceManager.jl")
 verify_no_running_processes()
+@timeit_include("MemoryUse.jl")
+verify_no_running_processes()
 
 # tests that don't start new processes:
 @timeit_include("ReloadFromFile.jl")

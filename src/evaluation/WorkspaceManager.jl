@@ -28,6 +28,8 @@ Base.@kwdef mutable struct Workspace
     is_offline_renderer::Bool=false
     original_LOAD_PATH::Vector{String}=String[]
     original_ACTIVE_PROJECT::Union{Nothing,String}=nothing
+    "The task that waits for cells that want to re-run themselves, see `start_relaying_self_updates`."
+    self_update_task::Union{Nothing,Task}=nothing
 end
 
 const SN = Tuple{ServerSession, Notebook}
@@ -83,6 +85,7 @@ function make_workspace((session, notebook)::SN; is_offline_renderer::Bool=false
     end
     
     @debug "Creating workspace process" notebook.path is_offline_renderer length(notebook.cells) exception=(ErrorException("test"), backtrace())
+    local worker = nothing # defined outside of the `try`, so that we can stop the process in the `catch` if something goes wrong.
     try
         worker = create_workspaceprocess(WorkerType; compiler_options=_merge_notebook_compiler_options(notebook, session.options.compiler), status=create_status)
         
@@ -102,12 +105,14 @@ function make_workspace((session, notebook)::SN; is_offline_renderer::Bool=false
         end)
 
         remote_log_channel = Malt.worker_channel(worker, quote
-            channel = Channel{Any}(10)
-            Main.PlutoRunner.setup_plutologger(
-                $(notebook.notebook_id),
+            # `let` to avoid defining a global `Main.channel`. For an `InProcessWorker`, that is a global of this process, which would keep the last channel (and the task relaying it, and the notebook that task refers to) alive forever.
+            let channel = Channel{Any}(10)
+                Main.PlutoRunner.setup_plutologger(
+                    $(notebook.notebook_id),
+                    channel
+                )
                 channel
-            )
-            channel
+            end
         end)
 
         run_channel = Malt.worker_channel(worker, :(Main.PlutoRunner.run_channel))
@@ -131,7 +136,8 @@ function make_workspace((session, notebook)::SN; is_offline_renderer::Bool=false
         Status.report_business_started!(init_status, Symbol(2))
 
         @async start_relaying_logs((session, notebook), remote_log_channel)
-        @async start_relaying_self_updates((session, notebook), run_channel)
+        # An offline renderer runs in this process, where `run_channel` is shared with every other in-process workspace, and nothing is ever going to ask it to re-run a cell, so it does not need this.
+        is_offline_renderer || (workspace.self_update_task = @async start_relaying_self_updates((session, notebook), run_channel, workspace))
         is_offline_renderer || cd_workspace(workspace, notebook.path)
         
         Status.report_business_finished!(init_status, Symbol(2))
@@ -157,6 +163,8 @@ function make_workspace((session, notebook)::SN; is_offline_renderer::Bool=false
     catch e
         Status.report_business_finished!(workspace_business, false)
         notebook.process_status = ProcessStatus.no_process
+        # Nobody else has a handle to this worker, so if we don't stop it, the process keeps running forever.
+        worker === nothing || stop_worker_in_background(worker)
         rethrow(e)
     end
 end
@@ -203,7 +211,6 @@ function precompile_nbpkg((session, notebook)::SN; io=stdout)::Bool
     
     expr = quote
         # This is just Pkg.precompile, but with extra stuff to relay stdout to the host process
-        import Pkg
         let
             buffer = Base.BufferStream()
             running = Ref(true)
@@ -227,7 +234,7 @@ function precompile_nbpkg((session, notebook)::SN; io=stdout)::Bool
             )
             
             try
-                Pkg.precompile(; already_instantiated=true, io=out_stream)
+                Main.PlutoRunner.precompile_notebook_environment(out_stream)
             finally
                 running[] = false
                 println(buffer)
@@ -263,15 +270,15 @@ struct PrecompilationFailedException <: Exception
     msg::String
 end
 
-function start_relaying_self_updates((session, notebook)::SN, run_channel)
-    while true
+function start_relaying_self_updates((session, notebook)::SN, run_channel, workspace::Workspace)
+    while !workspace.discarded
         try
             next_run_uuid = take!(run_channel)
 
             cell_to_run = notebook.cells_dict[next_run_uuid]
             Pluto.run_reactive!(session, notebook, notebook.topology, notebook.topology, Cell[cell_to_run]; user_requested_run=false)
         catch e
-            if !isopen(run_channel)
+            if workspace.discarded || !isopen(run_channel)
                 break
             end
             @error "Failed to relay self-update" exception=(e, catch_backtrace())
@@ -399,22 +406,35 @@ function create_workspaceprocess(WorkerType; compiler_options=CompilerOptions(),
         Status.report_business_started!(status, Symbol("Starting process"))
         Status.report_business_planned!(status, Symbol("Loading notebook boot environment"))
 
-        worker = WorkerType(; exeflags=_convert_to_flags(compiler_options))
-        
-        Status.report_business_finished!(status, Symbol("Starting process"))
-        withtoken(workspace_setup_token) do
-            Status.report_business_started!(status, Symbol("Loading notebook boot environment"))
-            Malt.remote_eval_wait(worker, process_preamble())
+        # Malt can print the stdout and stderr of the process for us, but then the tasks that do that never end, and keep the `Worker` in memory forever. So we do it ourselves, see `relay_worker_stdio`.
+        relay_stdio_ourselves = WorkerType === Malt.Worker && MALT_CAN_SKIP_STDIO_RELAY
+        worker = if relay_stdio_ourselves
+            Malt.Worker(; exeflags=_convert_to_flags(compiler_options), monitor_stdout=false, monitor_stderr=false)
+        else
+            WorkerType(; exeflags=_convert_to_flags(compiler_options))
         end
-    
-        # so that we NEVER break the workspace with an interrupt 🤕
-        Malt.remote_eval(worker, quote
-            while true
-                try
-                    wait()
-                catch end
+        
+        try
+            relay_stdio_ourselves && relay_worker_stdio(worker)
+            Status.report_business_finished!(status, Symbol("Starting process"))
+            withtoken(workspace_setup_token) do
+                Status.report_business_started!(status, Symbol("Loading notebook boot environment"))
+                Malt.remote_eval_wait(worker, process_preamble())
             end
-        end)
+        
+            # so that we NEVER break the workspace with an interrupt 🤕
+            Malt.remote_eval(worker, quote
+                while true
+                    try
+                        wait()
+                    catch end
+                end
+            end)
+        catch
+            # We are the only one with a handle to this worker, so if we don't stop it, the process keeps running forever.
+            stop_worker_in_background(worker)
+            rethrow()
+        end
     end
     
     Status.report_business_finished!(status)
@@ -468,8 +488,125 @@ function unmake_workspace(session_notebook::SN; async::Bool=false, verbose::Bool
     t = @async begin
         interrupt_workspace(workspace; verbose=false)
         Malt.stop(workspace.worker)
+        release_stopped_worker(workspace.worker)
+        workspace.worker isa Malt.InProcessWorker && release_in_process_channels(workspace)
     end
     async || wait(t)
+    nothing
+end
+
+"""
+Stop the worker process without waiting for it, and free its resources (see [`release_stopped_worker`](@ref)). For when we lost our only handle to the worker, e.g. because the startup of the workspace failed.
+"""
+function stop_worker_in_background(worker::Malt.AbstractWorker)
+    @async try
+        Malt.stop(worker)
+        release_stopped_worker(worker)
+    catch e
+        @warn "Failed to stop a notebook process" exception=(e, catch_backtrace())
+    end
+    nothing
+end
+
+"""
+Whether `Malt.Worker` accepts the options `monitor_stdout` and `monitor_stderr` (Malt 1.4 and up).
+"""
+const MALT_CAN_SKIP_STDIO_RELAY = try
+    hasmethod(Malt.Worker, Tuple{}, (:exeflags, :monitor_stdout, :monitor_stderr))
+catch
+    false
+end
+
+"""
+Print the stdout and stderr of the worker process in this terminal, with the prefix `[Worker 1234]:`. This is what Malt does if you let it (the default), but Malt's version has two problems:
+- Malt keeps its own end of the pipes open, so the end of the stream is never seen when the process exits, and the tasks that relay it keep waiting forever. These tasks refer to the worker, so every worker that was ever started would stay in memory.
+- The relay tasks of Malt are not cancelable, so we can't fix this from the outside, without printing a spurious empty line.
+
+Returns `worker`. Use together with `Malt.Worker(; monitor_stdout=false, monitor_stderr=false)`.
+"""
+function relay_worker_stdio(worker::Malt.Worker)
+    # We never write to these pipes, so we should close our end. The pipe is then closed as soon as the process exits.
+    close(worker.stdout.in)
+    close(worker.stderr.in)
+    for (pipe, color, get_io) in ((worker.stdout, 34, () -> stdout), (worker.stderr, 33, () -> stderr))
+        @async try
+            while !eof(pipe)
+                line = readline(pipe)
+                io = get_io()
+                prefix = get(io, :color, false) === true ? "\e[$(color)m[Worker $(worker.proc_pid)]:\e[39m " : "[Worker $(worker.proc_pid)]: "
+                write(io, prefix, line, '\n')
+                flush(io)
+            end
+        catch
+            # nothing to relay anymore
+        finally
+            close(pipe)
+        end
+    end
+    worker
+end
+
+"""
+Free the memory that a `Malt.Worker` still holds on to after its process was stopped with `Malt.stop`.
+
+Malt does not do this itself: it registers an `atexit` hook for every worker, which refers to the worker and is never removed, and `stop` leaves the socket of the worker open. So without this, the `Malt.Worker` (with its socket and read buffer, and process info) stays in memory for as long as the server runs, and the server starts a new worker every time that a notebook is opened or restarted. This is a few hundred kB per worker.
+
+This only touches workers whose process has exited. It is best-effort: it uses internals of Malt and Base, so any failure is ignored.
+"""
+function release_stopped_worker(worker::Malt.AbstractWorker)
+    (worker isa Malt.Worker && !Malt.isrunning(worker)) || return nothing
+
+    try
+        isopen(worker.current_socket) && close(worker.current_socket)
+    catch end
+
+    try
+        if isdefined(Base, :atexit_hooks) && isdefined(Base, :_atexit_hooks_lock)
+            lock(Base._atexit_hooks_lock) do
+                filter!(Base.atexit_hooks) do hook
+                    T = typeof(hook)
+                    # only closures that were made by Malt, and that capture this worker (which is `atexit(() -> stop(worker))`)
+                    !(parentmodule(T) === Malt && any(i -> getfield(hook, i) === worker, 1:fieldcount(T)))
+                end
+            end
+        end
+    catch end
+    nothing
+end
+
+"""
+Clean up a `Workspace` that was created with `make_workspace(...; is_offline_renderer=true)`, once you are done with it. `cell_ids` are the cells that were run in it.
+
+An offline renderer is not stored in `active_workspaces`, so `unmake_workspace` does not know about it. Without this cleanup, the task that relays its logs keeps waiting for new logs, forever. That task refers to the notebook, so it would keep the notebook and all of its outputs in memory, even after the notebook was shut down. Also, the `PlutoRunner` of this process would remember the results (and more) of the cells, forever.
+"""
+function discard_offline_workspace(workspace::Workspace, cell_ids=UUID[])
+    @assert workspace.is_offline_renderer && workspace.worker isa Malt.InProcessWorker
+    workspace.discarded = true
+    release_in_process_channels(workspace)
+    PlutoRunner.forget_cells!(cell_ids)
+    Malt.stop(workspace.worker)
+    nothing
+end
+
+"""
+Make the tasks that relay messages from an in-process `workspace` end, so that they stop keeping the notebook in memory.
+
+For a workspace in another process, they end when the process ends. But for a workspace in this process (the offline renderer, or when `workspace_use_distributed=false`), they wait on channels that are not going away, and they refer to the notebook, so without this, the notebook (and all of its outputs) would stay in memory forever, even after it was shut down.
+"""
+function release_in_process_channels(workspace::Workspace)
+    # This ends `start_relaying_logs` (after it relayed the logs that are still in the channel).
+    close(workspace.remote_log_channel)
+    # `PlutoRunner.pluto_log_channels` is shared with other in-process workspaces, so we only remove it if it is still ours.
+    if get(PlutoRunner.pluto_log_channels, workspace.notebook_id, nothing) === workspace.remote_log_channel
+        delete!(PlutoRunner.pluto_log_channels, workspace.notebook_id)
+    end
+    # `PlutoRunner.run_channel` is shared with other in-process workspaces, so we can't close it. Instead, we wake up the task that waits for it, and it will see that the workspace was discarded.
+    task = workspace.self_update_task
+    if task !== nothing && !istaskdone(task)
+        try
+            Base.schedule(task, InterruptException(); error=true)
+        catch end
+    end
     nothing
 end
 

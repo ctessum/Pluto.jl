@@ -210,6 +210,49 @@ using Pluto.WorkspaceManager: poll
 
     cleanup(🍭, notebook)
 
+    @testset "Progress logs are throttled" begin
+        # A progress bar only shows the latest log, but all logs of a cell are kept in memory by the Pluto server (and sent to every browser), so a loop that reports its progress on every iteration should not send all of them.
+        🍰 = ServerSession()
+        🍰.options.evaluation.workspace_use_distributed = true
+
+        progress_notebook = Notebook(Cell.([
+            """
+            begin
+                for i in 1:2000
+                    Base.CoreLogging.@logmsg Base.CoreLogging.LogLevel(-1) "working" progress=i/2000 _id=:bar1
+                    Base.CoreLogging.@logmsg Base.CoreLogging.LogLevel(-1) "other" progress=i/2000 _id=:bar2
+                end
+                Base.CoreLogging.@logmsg Base.CoreLogging.LogLevel(-1) "working" progress="done" _id=:bar1
+                Base.CoreLogging.@logmsg Base.CoreLogging.LogLevel(-1) "other" progress="done" _id=:bar2
+                @info "an ordinary log" 1
+                @info "an ordinary log" 2
+            end
+            """,
+        ]))
+
+        update_run!(🍰, progress_notebook, progress_notebook.cells)
+        @test progress_notebook.cells[1] |> noerror
+
+        logs = progress_notebook.cells[1].logs
+        progress_of(log) = Dict(log["kwargs"])["progress"][1]
+        is_progress(log) = log["level"] == "LogLevel(-1)"
+        # wait for the last log to arrive
+        @test poll(10, 1/60) do
+            count(!is_progress, logs) == 2
+        end
+
+        for id in ("bar1", "bar2")
+            bar = filter(log -> is_progress(log) && log["id"] == id, logs)
+            @test 2 <= length(bar) < 200 # (not 2001)
+            # The latest one is the last one that was logged: the final log is never skipped.
+            @test progress_of(last(bar)) == "\"done\""
+        end
+        # Logs that are not about progress are never skipped.
+        @test count(!is_progress, logs) == 2
+
+        cleanup(🍰, progress_notebook)
+    end
+
     @testset "Logging error fallback" begin
         # This testset needs to use a local worker to capture the worker stderr (which is
         # different from the notebook stderr)

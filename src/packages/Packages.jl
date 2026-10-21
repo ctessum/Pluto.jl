@@ -154,7 +154,7 @@ function sync_nbpkg_core(
                     
                     should_precompile_later = false
                     
-                    PkgCompat.refresh_registry_cache()
+                    PkgCompat.invalidate_registry_cache()
                     PkgCompat.clear_stdlib_compat_entries!(notebook.nbpkg_ctx)
                     
                     
@@ -165,8 +165,11 @@ function sync_nbpkg_core(
                         
                         # Resolve the package environment, using GracefulPkg.jl to solve any issues
                         Status.report_business!(pkg_status, :resolve) do
-                            with_auto_fixes(notebook, iolistener) do
-                                _resolve(notebook, iolistener)
+                            # An environment that is already resolved (like the one embedded in a notebook that was saved by Pluto) does not need to be resolved again. This matters for memory: resolving takes ~200 MB, which this process does not give back.
+                            if !PkgCompat.is_resolved_for_this_julia(notebook.nbpkg_ctx)
+                                with_auto_fixes(notebook, iolistener) do
+                                    _resolve(notebook, iolistener)
+                                end
                             end
                         end
                         
@@ -695,7 +698,7 @@ function update_nbpkg_core(
 
         return withtoken(pkg_token) do
             withlogcapture(iolistener) do
-                PkgCompat.refresh_registry_cache()
+                PkgCompat.invalidate_registry_cache()
                 PkgCompat.clear_stdlib_compat_entries!(notebook.nbpkg_ctx)
 
                 if !notebook.nbpkg_ctx_instantiated
@@ -722,7 +725,7 @@ function update_nbpkg_core(
                 end
 
 
-                PkgCompat.refresh_registry_cache()
+                PkgCompat.invalidate_registry_cache()
                 🐧 = !PkgCompat.is_original(notebook.nbpkg_ctx)
                 should_instantiate_again = !notebook.nbpkg_ctx_instantiated || 🐧
                 

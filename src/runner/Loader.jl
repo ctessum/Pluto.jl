@@ -7,10 +7,6 @@
 
 
 begin
-    pushfirst!(LOAD_PATH, "@stdlib")
-    import Pkg
-    popfirst!(LOAD_PATH)
-
     local original_LP = copy(LOAD_PATH)
     local original_AP = Base.ACTIVE_PROJECT[]
 
@@ -27,36 +23,9 @@ begin
         Base.ACTIVE_PROJECT[] = new_AP
         
         function setup()
-            # Set up our notebook boot package environment by adding a single package:
-            path = joinpath(@__DIR__, "PlutoRunner")
-            try
-                Pkg.develop([Pkg.PackageSpec(; path)])
-                # Pkg.develop([Pkg.PackageSpec(; path)]; io=devnull)
-            catch
-                @warn "Something went wrong while initializing the notebook boot environment... Trying again and showing you the output."
-                Pkg.develop([Pkg.PackageSpec(; path)])
-            end
-    
-            # Resolve
-            try
-                Pkg.resolve(; io=devnull) # supress IO
-            catch
-                @warn "Something went wrong while initializing the notebook boot environment... Trying again and showing you the output."
-                try
-                    Pkg.resolve()
-                catch e
-                    @error "Failed to resolve notebook boot environment" exception = (e, catch_backtrace())
-                end
-            end
-    
-            # Instantiate
-            try
-                # we don't suppress IO for this one because it can take very long, and that would be a frustrating experience without IO
-                # precompilation switched off because of https://github.com/fonsp/Pluto.jl/issues/875
-                Pkg.instantiate(; update_registry=false, allow_autoprecomp=false)
-            catch e
-                @error "Failed to instantiate notebook boot environment" exception = (e, catch_backtrace())
-            end
+            # Pkg is a big package, and this setup is only needed once, so it lives in a separate file that imports Pkg, which we only load when needed. (Most notebook processes never need Pkg.)
+            Base.include(Main, joinpath(@__DIR__, "BootSetup.jl"))
+            Base.invokelatest(Main.pluto_boot_environment_setup, joinpath(@__DIR__, "PlutoRunner"))
         end
 
         if !isfile(joinpath(new_AP, "Project.toml")) || !isfile(joinpath(new_AP, "Manifest.toml"))

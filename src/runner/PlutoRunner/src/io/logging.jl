@@ -10,13 +10,17 @@ struct PlutoCellLogger <: Logging.AbstractLogger
     cell_id::UUID
     workspace_count::Int # Used to invalidate previous logs
     message_limits::Dict{Any,Int}
+    progress_times::Dict{Any,Float64} # The last time that we sent a progress log, for each progress `id`. See `is_throttled_progress`.
+    progress_lock::ReentrantLock # for `progress_times`, because code can log from multiple threads (e.g. `@progress` with `Threads.@threads`)
 end
 function PlutoCellLogger(notebook_id, cell_id)
     notebook_log_channel = pluto_log_channels[notebook_id]
     PlutoCellLogger(nothing,
                     notebook_log_channel, cell_id,
                     moduleworkspace_count[],
-                    Dict{Any,Int}())
+                    Dict{Any,Int}(),
+                    Dict{Any,Float64}(),
+                    ReentrantLock())
 end
 
 struct CaptureLogger <: Logging.AbstractLogger
@@ -66,6 +70,34 @@ const BuiltinInts = @static isdefined(Core, :BuiltinInts) ? Core.BuiltinInts : U
 
 Logging.min_enabled_level(::PlutoCellLogger) = min(Logging.Debug, stdout_log_level)
 Logging.catch_exceptions(::PlutoCellLogger) = false
+
+"""
+Two progress logs of the same progress bar (`id`) are never sent less than this many seconds apart. (The progress bar only shows the latest one, and it can't update much faster than this.)
+"""
+const progress_log_min_interval = 0.05
+
+"""
+Should we skip this log message, because it is a progress update that comes too soon after the previous one of the same progress bar?
+
+A loop that logs its progress on every iteration can easily send millions of logs. That makes the loop much slower, because each log is sent to the Pluto server, and it fills the memory of the server: all logs of a cell are stored there (and sent to every browser), even though only the latest progress log of a progress bar is ever shown. The first log, the final log (`"done"`, or `progress >= 1`) and logs that don't have a numeric progress are never skipped.
+"""
+function is_throttled_progress(pl::PlutoCellLogger, level, id, kwargs)
+    level == progress_log_level || return false
+    progress = get(kwargs, :progress, nothing)
+    (progress isa Real && progress < 1) || return false
+
+    now = time()
+    lock(pl.progress_lock) do
+        last = get(pl.progress_times, id, -Inf)
+        if now - last < progress_log_min_interval
+            true
+        else
+            pl.progress_times[id] = now
+            false
+        end
+    end
+end
+
 function Logging.handle_message(pl::PlutoCellLogger, level, msg, _module, group, id, file, line; kwargs...)
     # println("receiving msg from ", _module, " ", group, " ", id, " ", msg, " ", level, " ", line, " ", file)
     # println("with types: ", "_module: ", typeof(_module), ", ", "msg: ", typeof(msg), ", ", "group: ", typeof(group), ", ", "id: ", typeof(id), ", ", "file: ", typeof(file), ", ", "line: ", typeof(line), ", ", "kwargs: ", typeof(kwargs)) # thanks Copilot
@@ -79,6 +111,8 @@ function Logging.handle_message(pl::PlutoCellLogger, level, msg, _module, group,
             return
         end
     end
+
+    is_throttled_progress(pl, level, id, kwargs) && return
 
     try
         yield()

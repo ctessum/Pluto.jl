@@ -270,6 +270,9 @@ function run_expression(
 
     logger = get_cell_logger(notebook_id, cell_id)
 
+    # forget the result of the previous run, so that its memory can be freed during this run. (Otherwise, re-running a cell that returns a large array needs twice as much memory: the old and the new array are in memory at the same time, even though the old one was removed from the workspace.)
+    cell_results[cell_id] = nothing
+
     # reset published objects
     cell_published_objects[cell_id] = Dict{String,Any}()
 

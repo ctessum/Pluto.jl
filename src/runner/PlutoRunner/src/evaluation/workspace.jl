@@ -21,3 +21,17 @@ function increment_current_module()::Symbol
 
     new_workspace_name
 end
+
+"""
+Precompile all packages in the active environment (the notebook environment), writing progress to `io`.
+
+This is what `Pkg.precompile(; already_instantiated=true)` does. On recent Julia versions, that is a thin wrapper around `Base.Precompilation.precompilepkgs`, which we can call directly. That way, the (large) `Pkg` standard library does not need to be loaded into every notebook process, which saves about 80 MB per notebook.
+"""
+function precompile_notebook_environment(io::IO)
+    if isdefined(Base, :Precompilation) && hasmethod(Base.Precompilation.precompilepkgs, Tuple{Vector{String}}, (:io,))
+        Base.Precompilation.precompilepkgs(String[]; io)
+    else
+        Pkg = Base.require(Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg"))
+        Base.invokelatest(Pkg.precompile; already_instantiated=true, io)
+    end
+end
